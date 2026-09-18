@@ -67,16 +67,15 @@ env:
   # with different keys. GCP fetch needs roles/cloudkms.publicKeyViewer; AWS
   # fetch assumes an OIDC role with kms:GetPublicKey only — both must admit this
   # workflow's token (ref-based subject: dev for staging, the tag for prod).
-  # TODO placeholders fail closed until the Voice PE keys are provisioned.
   KMS_LOCATION: europe-west1
   KMS_KEYRING: firmware-signing
   KMS_KEY: ${{ startsWith(github.ref, 'refs/tags/') && vars.FW_PROD_KMS_KEY || vars.FW_STAGING_KMS_KEY }}
   KMS_KEY_VERSION: "1"
-  GCP_PUBKEY_DER_SHA256: ${{ startsWith(github.ref, 'refs/tags/') && 'TODO-voice-pe-prod-gcp-pubkey-der-sha256' || 'TODO-voice-pe-staging-gcp-pubkey-der-sha256' }}
+  GCP_PUBKEY_DER_SHA256: ${{ startsWith(github.ref, 'refs/tags/') && '755f3b1e43d3d5543e40bd3754b45c9047e2ab2654e7dd1e63cb4c7ccf083b7c' || '972162fb3078c14783e886ab637414cdc0517d4fa9fd4fc5224485fb92803fde' }}
   AWS_REGION: ${{ startsWith(github.ref, 'refs/tags/') && vars.FW_PROD_AWS_REGION || vars.FW_STAGING_AWS_REGION }}
   AWS_ROLE_ARN: ${{ startsWith(github.ref, 'refs/tags/') && vars.FW_PROD_AWS_ROLE_ARN || vars.FW_STAGING_AWS_ROLE_ARN }}
   AWS_KMS_KEY_ARN: ${{ startsWith(github.ref, 'refs/tags/') && vars.FW_PROD_AWS_KMS_KEY_ARN || vars.FW_STAGING_AWS_KMS_KEY_ARN }}
-  AWS_PUBKEY_DER_SHA256: ${{ startsWith(github.ref, 'refs/tags/') && 'TODO-voice-pe-prod-aws-pubkey-der-sha256' || 'TODO-voice-pe-staging-aws-pubkey-der-sha256' }}
+  AWS_PUBKEY_DER_SHA256: ${{ startsWith(github.ref, 'refs/tags/') && 'c668c69eea348f946e47570e83e32ad5df3725e2c670de137e6101fcb5007247' || '72131bf92d25a0e5552b433ee6b00368f110fe7127db47b3a1073dccdf64bcfb' }}
 
 jobs:
   build:
