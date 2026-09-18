@@ -1,0 +1,370 @@
+# Post-sign publisher. Run manually after an Autograph operator has reviewed
+# and signed a build in the selected environment (staging or prod). Dispatch
+# staging publishes on dev and prod publishes ON THE RELEASE TAG (the prod
+# WIF provider only mints tokens for tag refs). It:
+#
+#   1. downloads firmware.signed.ota.bin + manifest.json from that
+#      environment's signed bucket (direct GETs — the prefix-scoped read
+#      grant does not allow listing);
+#   2. recomputes the SHA-256 against the manifest's signed_sha256;
+#   3. verifies the Secure Boot v2 signatures against BOTH signing keys
+#      (GCP KMS and the AWS backup key), each pinned by fingerprint;
+#   4. assembles firmware.signed.factory.bin by merging the signed app with
+#      the boot components retained by the unsigned build for the SAME commit
+#      (Autograph never builds factory images — only the app is signed);
+#   5. extracts the app back out of the factory image and re-verifies it; and
+#   6. publishes the verified artifacts to the serving layer
+#      (firmware.nabucasa.com): permanent versioned paths plus the selected
+#      channel's mutable pointer manifest.
+#
+# Channels: staging builds always land on manifest-staging.json. Prod builds
+# go to manifest-beta.json (the device's "Beta firmware" switch) or
+# manifest.json; promotion to production is a second dispatch of the same
+# version with channel=production.
+#
+# Never combine a signed app with boot components from a different build:
+# environment, version, commit, and boot_run_id must all refer to the same
+# unsigned build (its step summary prints the exact values to use here).
+#
+# There are no GitHub secrets: bucket read is via Workload Identity
+# Federation, and the artifact download uses the built-in GITHUB_TOKEN.
+# Adapted from NabuCasa/aux-2.
+
+name: Publish signed firmware
+
+run-name: Publish signed ${{ inputs.environment }} ${{ inputs.version }} (${{ inputs.commit }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Signing environment the build was uploaded to and signed in"
+        required: true
+        type: choice
+        options:
+          - staging
+          - prod
+      channel:
+        description: "Prod channel pointer to update (ignored for staging)"
+        required: true
+        type: choice
+        default: beta
+        options:
+          - beta
+          - production
+      version:
+        description: "Release version — the <version> path segment in the buckets (staging: e.g. 2026.09.17.8; prod: the release tag, e.g. 2026.9.0)"
+        required: true
+      commit:
+        description: "Full commit SHA the build was produced from"
+        required: true
+      boot_run_id:
+        description: "Run ID of the unsigned build holding the boot-<commit> artifact"
+        required: true
+
+# id-token: write mints the OIDC token exchanged for scoped bucket/KMS/S3
+# access; actions: read lets `gh run download` fetch the boot-component
+# artifact.
+permissions:
+  contents: read
+  id-token: write
+  actions: read
+
+# Serializes channel-manifest promotions.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  TARGET: home-assistant-voice
+  PROJECT_NAME: Nabu Casa.Home Assistant Voice PE
+  CHIP: esp32s3
+  FW_ENV: ${{ github.event.inputs.environment }}
+  CHANNEL: ${{ github.event.inputs.channel }}
+  # Environment-routed values from repo-level Actions variables
+  # (FW_STAGING_* / FW_PROD_*). Deliberately NOT GitHub Environments:
+  # attaching `environment:` to a job changes the OIDC token's subject claim
+  # from ref-based to environment-based, which the ref-restricted WIF
+  # providers (prod: tags only) would reject.
+  PROJECT_ID: ${{ github.event.inputs.environment == 'prod' && vars.FW_PROD_PROJECT_ID || vars.FW_STAGING_PROJECT_ID }}
+  SIGNED_BUCKET: ${{ github.event.inputs.environment == 'prod' && vars.FW_PROD_SIGNED_BUCKET || vars.FW_STAGING_SIGNED_BUCKET }}
+  WIF_PROVIDER: ${{ github.event.inputs.environment == 'prod' && vars.FW_PROD_WIF_PROVIDER || vars.FW_STAGING_WIF_PROVIDER }}
+  # Every release must verify against BOTH signing keys (Autograph
+  # dual-signs): the GCP KMS key and the AWS backup key. Devices only trust
+  # the keys carried in their running app's signature sector, so publishing
+  # a single-signed image would shrink the fleet's trust set to that one
+  # key. Each public key is pinned to the SHA-256 of its DER encoding so a
+  # wrong environment or an unexpected rotation fails loudly. The pins are
+  # trust anchors and stay IN THIS FILE (git-reviewed), not in variables.
+  KMS_LOCATION: europe-west1
+  KMS_KEYRING: firmware-signing
+  KMS_KEY: ${{ github.event.inputs.environment == 'prod' && vars.FW_PROD_KMS_KEY || vars.FW_STAGING_KMS_KEY }}
+  KMS_KEY_VERSION: "1"
+  GCP_PUBKEY_DER_SHA256: ${{ github.event.inputs.environment == 'prod' && '755f3b1e43d3d5543e40bd3754b45c9047e2ab2654e7dd1e63cb4c7ccf083b7c' || '972162fb3078c14783e886ab637414cdc0517d4fa9fd4fc5224485fb92803fde' }}
+  AWS_REGION: ${{ github.event.inputs.environment == 'prod' && vars.FW_PROD_AWS_REGION || vars.FW_STAGING_AWS_REGION }}
+  AWS_ROLE_ARN: ${{ github.event.inputs.environment == 'prod' && vars.FW_PROD_AWS_ROLE_ARN || vars.FW_STAGING_AWS_ROLE_ARN }}
+  AWS_KMS_KEY_ARN: ${{ github.event.inputs.environment == 'prod' && vars.FW_PROD_AWS_KMS_KEY_ARN || vars.FW_STAGING_AWS_KMS_KEY_ARN }}
+  AWS_PUBKEY_DER_SHA256: ${{ github.event.inputs.environment == 'prod' && 'c668c69eea348f946e47570e83e32ad5df3725e2c670de137e6101fcb5007247' || '72131bf92d25a0e5552b433ee6b00368f110fe7127db47b3a1073dccdf64bcfb' }}
+  # S3 serving layer: shared bucket behind firmware.nabucasa.com.
+  # The publishing role's trust admits dev + tag refs only and can write
+  # only under the home-assistant-voice-pe/ prefix.
+  S3_PUBLISH_ROLE: arn:aws:iam::330564535865:role/gha-home-assistant-voice-pe-s3
+  S3_PUBLISH_REGION: us-east-1
+  S3_BASE: s3://nc-esp32-firmware/home-assistant-voice-pe
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      # Prod tokens only mint on tag refs (WIF provider condition), so a prod
+      # publish must be dispatched ON the release tag:
+      #   gh workflow run publish-signed-firmware.yml --ref <tag> ...
+      # Staging publishes dispatch on dev. Fail fast with a clear message
+      # instead of a cryptic STS error at the auth step. Also fail loudly on
+      # unset repo Actions variables — they're invisible to PR review.
+      - name: Check dispatch ref and environment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${FW_ENV}" = "prod" ] && [[ "${GITHUB_REF}" != refs/tags/* ]]; then
+            echo "prod publishes must be dispatched on the release tag, not '${GITHUB_REF}'" >&2
+            echo "(the prod WIF provider only mints tokens for refs/tags/*):" >&2
+            echo "  gh workflow run publish-signed-firmware.yml --ref <tag> -f environment=prod ..." >&2
+            exit 1
+          fi
+          for v in PROJECT_ID SIGNED_BUCKET WIF_PROVIDER KMS_KEY AWS_REGION AWS_ROLE_ARN AWS_KMS_KEY_ARN; do
+            if [ -z "${!v}" ]; then
+              echo "Missing repo Actions variable for ${FW_ENV} ${v} (FW_$(echo "${FW_ENV}" | tr a-z A-Z)_…)" >&2
+              exit 1
+            fi
+          done
+
+      # The config must come from the exact commit that was built and signed.
+      - name: Checkout release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.commit }}
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+
+      - name: Authenticate to Google Cloud (WIF, no keys)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093  # v3.0.0
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+
+      - name: Authenticate to AWS (OIDC, no keys)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fetch and pin the verification public keys
+        run: |
+          set -euo pipefail
+          gcloud kms keys versions get-public-key "${KMS_KEY_VERSION}" \
+            --project "${PROJECT_ID}" \
+            --location "${KMS_LOCATION}" \
+            --keyring "${KMS_KEYRING}" \
+            --key "${KMS_KEY}" \
+            --output-file signing_pubkey.pem
+          actual=$(openssl pkey -pubin -in signing_pubkey.pem -outform DER | sha256sum | cut -d' ' -f1)
+          if [ "$actual" != "${GCP_PUBKEY_DER_SHA256}" ]; then
+            echo "GCP public key fingerprint mismatch — refusing to verify against it" >&2
+            echo "expected=${GCP_PUBKEY_DER_SHA256}" >&2
+            echo "actual  =${actual}" >&2
+            exit 1
+          fi
+          # AWS KMS returns the public key as base64-encoded DER — the
+          # fingerprint is the SHA-256 of exactly those DER bytes.
+          aws kms get-public-key --key-id "${AWS_KMS_KEY_ARN}" \
+            --query PublicKey --output text | base64 -d > aws_signing_pubkey.der
+          actual_aws=$(sha256sum aws_signing_pubkey.der | cut -d' ' -f1)
+          if [ "$actual_aws" != "${AWS_PUBKEY_DER_SHA256}" ]; then
+            echo "AWS public key fingerprint mismatch — refusing to verify against it" >&2
+            echo "expected=${AWS_PUBKEY_DER_SHA256}" >&2
+            echo "actual  =${actual_aws}" >&2
+            exit 1
+          fi
+          openssl pkey -pubin -inform DER -in aws_signing_pubkey.der \
+            -out aws_signing_pubkey.pem
+
+      - name: Download boot components from the unsigned build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "${{ github.event.inputs.boot_run_id }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            -n "boot-${{ github.event.inputs.commit }}" \
+            -D boot
+
+      - name: Download, verify, and assemble signed firmware
+        shell: bash
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+          COMMIT: ${{ github.event.inputs.commit }}
+        run: |
+          set -euo pipefail
+
+          base="${TARGET}/${VERSION}/${COMMIT}"
+          out="signed/${TARGET}"
+          mkdir -p "$out"
+
+          echo "Fetching signed artifacts for ${TARGET} (${FW_ENV})"
+          gcloud storage cp "gs://${SIGNED_BUCKET}/${base}/firmware.signed.ota.bin" "$out/firmware.signed.ota.bin"
+          gcloud storage cp "gs://${SIGNED_BUCKET}/${base}/manifest.json" "$out/manifest.json"
+
+          # Gate 1: recompute the signed digest against the manifest.
+          expected=$(jq -r '.signed_sha256 // empty' "$out/manifest.json")
+          actual=$(sha256sum "$out/firmware.signed.ota.bin" | cut -d' ' -f1)
+          if [ -z "$expected" ]; then
+            echo "Manifest is missing signed_sha256" >&2
+            exit 1
+          fi
+          if [ "$expected" != "$actual" ]; then
+            echo "SHA-256 mismatch — refusing to publish" >&2
+            echo "expected=$expected" >&2
+            echo "actual  =$actual" >&2
+            exit 1
+          fi
+
+          # Gate 2: Secure Boot v2 signatures — the image must verify
+          # against BOTH pinned keys (see the env block for why a
+          # single-signed release must never be published).
+          uvx --from esptool espsecure verify-signature --version 2 \
+            --keyfile signing_pubkey.pem "$out/firmware.signed.ota.bin"
+          uvx --from esptool espsecure verify-signature --version 2 \
+            --keyfile aws_signing_pubkey.pem "$out/firmware.signed.ota.bin"
+
+          # Assemble the factory image: merge the signed app with the boot
+          # components from the same build, using the offsets and flash
+          # settings recorded in that build's flasher_args.json.
+          fa="boot/${TARGET}/flasher_args.json"
+          if [ ! -f "$fa" ]; then
+            echo "Boot components are missing flasher_args.json" >&2
+            exit 1
+          fi
+          app_offset=$(jq -r '.app.offset' "$fa")
+          merge_args=()
+          while read -r offset file; do
+            if [ "$offset" = "$app_offset" ]; then
+              merge_args+=( "$offset" "$out/firmware.signed.ota.bin" )
+            else
+              merge_args+=( "$offset" "boot/${TARGET}/$file" )
+            fi
+          done < <(jq -r '.flash_files | to_entries[] | "\(.key) \(.value)"' "$fa")
+          uvx --from esptool esptool --chip "${CHIP}" merge-bin \
+            -o "$out/firmware.signed.factory.bin" \
+            --flash-mode "$(jq -r '.flash_settings.flash_mode' "$fa")" \
+            --flash-freq "$(jq -r '.flash_settings.flash_freq' "$fa")" \
+            --flash-size "$(jq -r '.flash_settings.flash_size' "$fa")" \
+            "${merge_args[@]}"
+
+          # Gate 3: extract the app back out of the factory image and
+          # re-verify its signatures before publishing anything.
+          if [ $(( app_offset % 4096 )) -ne 0 ]; then
+            echo "App offset $app_offset is not 4 KiB aligned" >&2
+            exit 1
+          fi
+          dd if="$out/firmware.signed.factory.bin" of="$out/app-extracted.bin" \
+            bs=4096 skip=$(( app_offset / 4096 )) status=none
+          uvx --from esptool espsecure verify-signature --version 2 \
+            --keyfile signing_pubkey.pem "$out/app-extracted.bin"
+          uvx --from esptool espsecure verify-signature --version 2 \
+            --keyfile aws_signing_pubkey.pem "$out/app-extracted.bin"
+
+      # Everything below needing AWS switches identity: the pubkey-reader
+      # credentials are no longer required (keys already fetched and pinned),
+      # and the S3 publishing role can only write under our prefix.
+      - name: Authenticate to AWS for artifact publishing (OIDC, no keys)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd  # v6.3.0
+        with:
+          role-to-assume: ${{ env.S3_PUBLISH_ROLE }}
+          aws-region: ${{ env.S3_PUBLISH_REGION }}
+
+      # Layout: versioned artifacts are permanent (<prefix>/<version>/...)
+      # and carry their own <version>/manifest.json (paths relative to it) so
+      # the Autograph release index can list any version (HDW-894); each
+      # channel is a mutable pointer manifest beside them (production ->
+      # manifest.json, beta -> manifest-beta.json, staging ->
+      # manifest-staging.json). Promotion/rollback = rewriting the pointer;
+      # binaries never move.
+      - name: Publish artifacts and channel manifest to S3
+        shell: bash
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+          COMMIT: ${{ github.event.inputs.commit }}
+        run: |
+          set -euo pipefail
+
+          out="signed/${TARGET}"
+          dest="${S3_BASE}"
+
+          export OTA_MD5="$(md5sum "$out/firmware.signed.ota.bin" | cut -d' ' -f1)"
+          export OTA_SHA256="$(sha256sum "$out/firmware.signed.ota.bin" | cut -d' ' -f1)"
+          export FACTORY_MD5="$(md5sum "$out/firmware.signed.factory.bin" | cut -d' ' -f1)"
+          export FACTORY_SHA256="$(sha256sum "$out/firmware.signed.factory.bin" | cut -d' ' -f1)"
+          # Same document twice: the channel pointer references <version>/...,
+          # the per-version manifest sits beside the binaries and references
+          # them directly.
+          for target in channel:"${VERSION}/" version:""; do
+          PATH_PREFIX="${target#*:}" \
+          python3 - > "$out/${target%%:*}-manifest.json" <<'PY'
+          import json, os
+          v = os.environ["VERSION"]
+          p = os.environ["PATH_PREFIX"]
+          print(json.dumps({
+              "name": os.environ["PROJECT_NAME"],
+              "version": v,
+              "home_assistant_domain": "esphome",
+              "new_install_prompt_erase": False,
+              "builds": [{
+                  "chipFamily": "ESP32-S3",
+                  "ota": {
+                      "path": f"{p}firmware-esp32s3.ota.bin",
+                      "md5": os.environ["OTA_MD5"],
+                      "sha256": os.environ["OTA_SHA256"],
+                      "release_url": f"https://github.com/NabuCasa/home-assistant-voice-pe/commit/{os.environ['COMMIT']}",
+                  },
+                  "parts": [{
+                      "path": f"{p}firmware-esp32s3.factory.bin",
+                      "offset": 0,
+                      "md5": os.environ["FACTORY_MD5"],
+                      "sha256": os.environ["FACTORY_SHA256"],
+                  }],
+              }],
+          }, indent=2))
+          PY
+          done
+
+          echo "Uploading ${TARGET} ${VERSION} artifacts"
+          aws s3 cp "$out/firmware.signed.ota.bin" "$dest/${VERSION}/firmware-esp32s3.ota.bin"
+          aws s3 cp "$out/firmware.signed.factory.bin" "$dest/${VERSION}/firmware-esp32s3.factory.bin"
+          aws s3 cp "$out/version-manifest.json" "$dest/${VERSION}/manifest.json" \
+            --content-type application/json
+
+          if [ "${FW_ENV}" != "prod" ]; then
+            channel_manifest="manifest-staging.json"
+          elif [ "${CHANNEL}" = "production" ]; then
+            channel_manifest="manifest.json"
+          else
+            channel_manifest="manifest-beta.json"
+          fi
+          echo "Promoting ${channel_manifest} -> ${VERSION}"
+          aws s3 cp "$out/channel-manifest.json" "$dest/${channel_manifest}" \
+            --content-type application/json --cache-control no-cache
+          echo "channel_manifest=${channel_manifest}" >> "$GITHUB_ENV"
+
+      - name: Publish summary
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+          COMMIT: ${{ github.event.inputs.commit }}
+        run: |
+          {
+            echo "## Signed firmware published (${FW_ENV})"
+            echo ""
+            echo "- \`${TARGET}\` ${VERSION} (${COMMIT}) — dual signatures verified, factory image assembled, published to https://firmware.nabucasa.com/home-assistant-voice-pe/${VERSION}/"
+            echo "- channel pointer updated: \`${channel_manifest}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

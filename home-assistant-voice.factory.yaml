@@ -1,3 +1,12 @@
+# Release version stamped by CI; local builds default to 0.0.0
+# (downgrade protection requires dotted-numeric).
+# Update channel: CI sets FW_CHANNEL_MANIFEST (manifest.json on prod/tag
+# builds); the default keeps local and staging builds on the staging channel.
+substitutions:
+  fw_version: !env_var FW_VERSION 0.0.0
+  fw_channel_manifest: !env_var FW_CHANNEL_MANIFEST manifest-staging.json
+  fw_manifest_base: https://firmware.nabucasa.com/home-assistant-voice-pe
+
 packages:
   # This is an inline package to prefix the on_client_connected with the wait_until action
   # It must appear before the actual package so it becomes the orignal config and the
@@ -16,7 +25,19 @@ packages:
 esphome:
   project:
     name: Nabu Casa.Home Assistant Voice PE
-    version: dev
+    version: ${fw_version}
+
+esp32:
+  framework:
+    advanced:
+      # Compiled-in OTA trust anchor; key digests are derived from KMS and
+      # written to secrets.yaml by CI (see .github/workflows/upload-unsigned-firmware.yml).
+      signed_ota_verification:
+        signing_scheme: rsa3072
+        verification_keys:
+          - !secret fw_key_digest_gcp
+          - !secret fw_key_digest_aws
+      enable_ota_downgrade_protection: true
 
 ota:
   - platform: http_request
@@ -24,14 +45,17 @@ ota:
 
 http_request:
 
+provisioning:
+  timeout: 15min
+
 update:
   - platform: http_request
     name: None
     id: update_http_request
-    source: https://firmware.esphome.io/home-assistant-voice-pe/home-assistant-voice/manifest.json
+    source: ${fw_manifest_base}/${fw_channel_manifest}
 
 dashboard_import:
-  package_import_url: github://esphome/home-assistant-voice-pe/home-assistant-voice.yaml
+  package_import_url: github://NabuCasa/home-assistant-voice-pe/home-assistant-voice.yaml
 
 wifi:
   on_connect:
@@ -67,9 +91,9 @@ switch:
     restore_mode: RESTORE_DEFAULT_OFF
     on_turn_on:
       - logger.log: "OTA updates set to use Beta firmware"
-      - lambda: id(update_http_request).set_source_url("https://firmware.esphome.io/home-assistant-voice-pe/home-assistant-voice/manifest-beta.json");
+      - lambda: id(update_http_request).set_source_url("${fw_manifest_base}/manifest-beta.json");
       - component.update: update_http_request
     on_turn_off:
       - logger.log: "OTA updates set to use Production firmware"
-      - lambda: id(update_http_request).set_source_url("https://firmware.esphome.io/home-assistant-voice-pe/home-assistant-voice/manifest.json");
+      - lambda: id(update_http_request).set_source_url("${fw_manifest_base}/${fw_channel_manifest}");
       - component.update: update_http_request
