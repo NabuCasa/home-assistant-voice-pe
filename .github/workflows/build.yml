@@ -17,7 +17,7 @@ concurrency:
 
 env:
   CONFIG: home-assistant-voice.factory.yaml
-  ESPHOME_VERSION: 2026.9.0
+  ESPHOME_VERSION: 2026.10.2
 
 jobs:
   build:

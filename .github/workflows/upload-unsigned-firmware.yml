@@ -43,7 +43,7 @@ env:
   # dashboard and is permanent once firmware ships. Set explicitly because the
   # config basename carries the .factory suffix.
   TARGET: home-assistant-voice
-  ESPHOME_VERSION: 2026.9.0
+  ESPHOME_VERSION: 2026.10.2
   # Target block for the manifest — must match the KMS key config in the
   # signing dashboard.
   CHIP: esp32s3
